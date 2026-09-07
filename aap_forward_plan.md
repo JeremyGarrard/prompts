@@ -6,7 +6,7 @@ repo" is the control plane, "the dbt project" is the sibling project that owns t
 transformations, and the MetricFlow manifest, "the gateway" is the enterprise LLM endpoint.
 
 The plan has two tracks that run in parallel and one dependency between them: the platform's
-data-engineering agent cannot be real until the dbt project has a sandbox target. Everything
+data-engineering agent cannot be real until the dbt project has an isolated build target. Everything
 else in each track is independent.
 
 Each phase lists what to build, what blocks it, and a "done when" check. Do phases in order
@@ -154,66 +154,111 @@ person involved; the UI is reachable by a colleague.
 
 ## Track B: the dbt project
 
-### B1. Inventory and baseline
+Re-scoped on 2026-09-07 after the dbt inventory. The project is larger and further along
+than the platform document implied: roughly 140 models in a staging, intermediate, core,
+reporting layering that already matches the reference design, a real analyst table at
+account-month grain, a time spine, two semantic models, and about 550 metrics that MetricFlow
+can compile. It is also single-target, single-schema, Snowflake-locked, thinly tested at the
+grain level, human-run from wrapper scripts, and has no CI. Track B is therefore not "build a
+data plane"; it is "make the one that exists safe for machines to build and query."
+
+### B1. Tests that prove grain and range
 
 Blocked by: nothing.
 
-Run the dbt inventory prompt. Then: every model gets a YAML entry with a description and a grain
-sentence; every key gets unique and not_null; every foreign key gets a relationships test; every
-enum gets accepted_values; every rate and amount gets an accepted_range. Sources get freshness.
+- Migrate every generic test to the `arguments:` form (mechanical; removes about 90
+  deprecation warnings and future breakage).
+- Every model with an undetermined grain (about 30, mostly staging) gets a uniqueness test that
+  states its grain, or a comment explaining why it has none. Every untested model (about 17)
+  gets at least key tests.
+- `relationships` on every foreign key the marts join on; `accepted_range` on every rate and
+  amount metric input; restore the hollowed-out reconciliation test or delete it.
+- Run the full suite once and keep the artifact. Right now only a selected report suite has a
+  retained passing run.
 
-Done when: `dbt build` is green with zero untested models and zero sources without freshness.
+Done when: a full `dbt build` artifact exists with zero failures, every model has a stated
+grain, no deprecation warnings.
 
-### B2. Portability and contracts
-
-Blocked by: nothing.
-
-- Replace vendor-specific functions with dbt cross-database macros. The test is that the
-  project compiles and builds on DuckDB against a small sample of RAW.
-- Enforce a contract on the analyst table (one row per entity per period, inactive periods
-  included) with explicit casts so types agree on both engines.
-- Make `dim_date` the MetricFlow time spine if it is not already.
-
-Done when: the same models build on Snowflake and DuckDB; a deliberate type change on the
-analyst table fails the build.
-
-### B3. Sandbox and CI targets
-
-Blocked by: nothing, but this is what unblocks A5.
-
-- Add a `sandbox` target whose schemas are prefixed per run (`SANDBOX_<id>_marts`) via the
-  custom schema macro, and a `ci` target with the same pattern per pull request.
-- CI on every pull request: DuckDB lane with no credentials (build everything on the sample),
-  then a Snowflake slim-CI lane (`state:modified+` with defer) into the per-PR schema, torn down
-  on merge.
-
-Done when: a pull request builds in its own schema and a broken test blocks merge; the platform
-can build a proposal in a sandbox without touching production schemas.
-
-### B4. Semantic layer as the interface
+### B2. The analyst table as a contract
 
 Blocked by: nothing.
 
-- Every metric gets a description a reviewer can read. Entities on every semantic model so joins
-  are inferred. Deprecate metrics computed in dashboards or notebooks by defining them here.
-- Publish the semantic layer as a Snowflake semantic view (OSI export when available on the
-  account, hand-maintained DDL until then) so Cortex and BI read the same definitions.
+- Decide the fate of the legacy columns emitted as NULL: drop them or fill them. A contract
+  cannot be enforced on columns nobody can type.
+- Build a dense account-period calendar so inactive months exist as rows. Active rate,
+  delinquency rate, and every "share of open accounts" metric need that denominator.
+- Enforce `contract: enforced` with explicit types on the analyst table, then on the core
+  dimensions and facts.
+- Fix the layering violation where an intermediate model reads reporting marts.
 
-Done when: `mf validate-configs` passes; a question answered in the platform and the same
-question answered in Cortex return the same number.
+Done when: a deliberate type change on the analyst table fails the build; an account open in
+a month with no activity has a row with activity flags false.
 
-### B5. Access
+### B3. Isolation for sandbox and CI builds
 
-Blocked by: decision D1.
+Blocked by: nothing for the prefix approach; a grants decision for the schema approach.
 
-- A select-only consumer role on marts, reference, and the semantic view. One service user per
-  consumer (platform, notebooks, BI) with a scoped, expiring token so any consumer can be
-  revoked alone.
-- dbt writes only from the scheduler as the engineering role. Humans get the engineering role
-  for local development against a personal schema.
+Per-layer schemas are blocked by grants and the profile runs everything into one flat schema.
+Do not wait on that. The object-prefix mechanism that already exists is the isolation unit:
 
-Done when: the consumer role can select from the analyst table, cannot see RAW or staging, and
-cannot write anything.
+- A `sandbox` target that derives the object prefix from a thread or branch id, so a proposal
+  builds as `<prefix>_<model>` beside production objects without touching them.
+- A `ci` target that does the same from the pull-request number.
+- Teardown: a wrapper step that drops every object with the run prefix.
+- Keep the flat-schema flag; per-layer schemas can come later if grants allow.
+
+Done when: two builds with different prefixes run at once and neither sees the other; the
+platform data-engineering agent can build a proposal with a prefix and report test results.
+
+### B4. CI on Snowflake, not on a second engine
+
+Blocked by: a service identity for the CI runner (decision D6).
+
+The SQL is Snowflake-locked in almost every model (window qualifiers, date arithmetic, cast
+syntax, generators, list aggregation, grouped-by-all). Porting 140 models to cross-engine
+macros is weeks of work with little payoff. Do not build a DuckDB lane for this project.
+
+- CI runs on Snowflake with the prefix isolation from B3: `dbt build --select state:modified+`
+  with defer to the last production manifest, in the PR prefix, torn down on merge.
+- The Kerberos-to-short-lived-token wrapper does not work for a headless runner. CI needs a
+  service identity with its own credential path, which is a platform ask.
+- Pin the utility package to an exact version and commit the lock file.
+- Branch protection with the CI check required; a CODEOWNERS file naming the analyst owner.
+
+Done when: a pull request that breaks a test cannot merge; the runner authenticates without a
+person.
+
+### B5. The semantic layer as the interface
+
+Blocked by: nothing.
+
+- Four hundred of the 550 metrics have no description. The platform alignment step reads
+  descriptions to pick metrics; undescribed metrics are invisible to it in practice. Write
+  descriptions for every consumer-facing metric first, then the internal component metrics.
+- Separate consumer-facing metrics from internal numerator and denominator components by
+  naming or metadata so the catalog the platform shows is short and readable.
+- Run `mf validate-configs` and keep it green. Add month, quarter, and year granularities to
+  the time spine if any consumer needs offset metrics.
+- Publish the analyst-table semantic model as a Snowflake semantic view (OSI export when the
+  account has it, DDL until then).
+
+Done when: every metric the platform can route to has a description a reviewer would accept;
+the catalog the platform shows has fewer than a hundred entries; a question answered in the
+platform and in Cortex agree.
+
+### B6. Sources, scheduling, and access
+
+Blocked by: D1 (reader role), D3 (orchestrator), and source owners for freshness fields.
+
+- Freshness: every source gets a `loaded_at_field`; sources without one get a documented
+  owner and a reason.
+- A production target in the profile so the documented production path is runnable, and a
+  scheduler that runs it. The wrapper scripts become the scheduler steps, not the scheduler.
+- A select-only consumer role on the core and reporting marts plus the semantic view, with one
+  service user per consumer.
+
+Done when: the production build runs without a person on the schedule; the reader role can
+select the analyst table and nothing upstream.
 
 ---
 
@@ -226,6 +271,7 @@ cannot write anything.
 | D3 | Where does the platform run in production, and which orchestrator runs the dbt project? | Platform team | A6 |
 | D4 | Is the gateway the production model transport, or is direct Bedrock coming? | Platform team | A4, A5 cost and latency |
 | D5 | Is Monday the human-facing queue, with the event log as the record, or the other way round? | Analytics leadership | A0 projection design |
+| D6 | Can a headless CI runner get its own warehouse identity, given the current human Kerberos-to-token path? | Platform team | B4 |
 
 The recommendation on D1 is to start with MetricFlow-only and earn the reader role with the
 escrow record. On D5, the event log is the record; Monday is a projection.
@@ -251,9 +297,11 @@ Week one to two: A0, A1, B1 in parallel. These are pure code and fix the two cor
 the state document called out.
 
 Week three to four: A2, A3, B2, B3. The platform becomes something a colleague can use and
-review; the dbt project becomes something a machine can build in isolation.
+review; the dbt project becomes something a machine can build in isolation using object
+prefixes.
 
-After that: A4 in its MetricFlow-only form, A5 once B3 exists, B4 and B5 as governance allows,
+After that: A4 in its MetricFlow-only form, A5 once B3 exists, B5 in parallel because it
+directly improves alignment quality, B4 and B6 as the identity and access decisions land,
 A6 when the platform decisions land.
 
 Every phase leaves the system working. Nothing here requires a big-bang cutover.
