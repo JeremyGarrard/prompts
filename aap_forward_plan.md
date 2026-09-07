@@ -26,7 +26,7 @@ around it.
 4. One routing path. The legacy one-shot path is retired, not maintained alongside.
 5. Append-only events are the record. Any projection (Monday, a dashboard) is a view of the
    events, never the other way round.
-6. Portable SQL in the dbt project so a second engine can run CI without warehouse credentials.
+6. Isolated builds in the dbt project (object prefixes now, schemas if grants allow) so CI and agents build beside production without touching it.
 7. Every phase ships with tests that run without a model or a warehouse.
 
 ---
